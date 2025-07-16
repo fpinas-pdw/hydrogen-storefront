@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Cargar variables del archivo .env local
+# Cargar variables del archivo .env local (de _deploy/)
 if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
 else
@@ -9,17 +9,29 @@ else
 fi
 
 # Verificar que las variables requeridas estén definidas
-if [ -z "$RESOURCE_GROUP" ] || [ -z "$REGISTRY_NAME" ] || [ -z "$APP_SERVICE_NAME" ] || [ -z "$APP_SERVICE_PLAN" ] || [ -z "$DOCKER_IMAGE_NAME" ]; then
+if [ -z "$RESOURCE_GROUP" ] || [ -z "$REGISTRY_NAME" ] || [ -z "$CONTAINER_APP_NAME" ] || [ -z "$DOCKER_IMAGE_NAME" ] || [ -z "$DOCKER_IMAGE_TAG" ]; then
     echo "Error: Variables requeridas no están definidas en .env"
-    echo "Requeridas: RESOURCE_GROUP, REGISTRY_NAME, APP_SERVICE_NAME, APP_SERVICE_PLAN, DOCKER_IMAGE_NAME"
+    echo "Requeridas: RESOURCE_GROUP, REGISTRY_NAME, CONTAINER_APP_NAME, DOCKER_IMAGE_NAME, DOCKER_IMAGE_TAG"
     exit 1
+fi
+
+CONTAINERAPPS_ENV_NAME="${CONTAINERAPPS_ENV_NAME:-shopify-env}"
+LOCATION="${LOCATION:-westeurope}" # Cambia por tu región si es necesario
+
+# Log Analytics Workspace opcional
+if [ -z "$LOG_ANALYTICS_WORKSPACE" ]; then
+    LOG_ANALYTICS_WORKSPACE="${CONTAINERAPPS_ENV_NAME}-logs"
 fi
 
 echo "🚀 Iniciando proceso de deploy..."
 echo "Resource Group: $RESOURCE_GROUP"
 echo "Registry: $REGISTRY_NAME"
-echo "App Service: $APP_SERVICE_NAME"
+echo "Container App: $CONTAINER_APP_NAME"
 echo "Docker Image: $DOCKER_IMAGE_NAME"
+echo "Docker Tag: $DOCKER_IMAGE_TAG"
+echo "Container Apps Env: $CONTAINERAPPS_ENV_NAME"
+echo "Log Analytics Workspace: $LOG_ANALYTICS_WORKSPACE"
+echo "Location: $LOCATION"
 
 # Cambiar al directorio raíz para el build de Docker
 cd ..
@@ -52,7 +64,7 @@ fi
 
 # 4. Taggear imagen
 echo "🏷️ Taggeando imagen..."
-docker tag $DOCKER_IMAGE_NAME $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:latest
+docker tag $DOCKER_IMAGE_NAME $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG
 if [ $? -ne 0 ]; then
     echo "❌ Error al taggear imagen"
     exit 1
@@ -60,72 +72,83 @@ fi
 
 # 5. Push a ACR
 echo "⬆️ Subiendo imagen a ACR..."
-docker push $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:latest
+docker push $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG
 if [ $? -ne 0 ]; then
     echo "❌ Error al subir imagen a ACR"
     exit 1
 fi
 
-# 6. Crear App Service Plan (si no existe)
-echo "📋 Creando App Service Plan..."
-az appservice plan create --name $APP_SERVICE_PLAN --resource-group $RESOURCE_GROUP --sku B1 --is-linux
-if [ $? -ne 0 ]; then
-    echo "⚠️ App Service Plan ya existe o error al crear (continuando...)"
-fi
+# 6. Configurar permisos de ACR para Container Apps (usar managed identity)
+echo "🔑 Configurando permisos de ACR..."
+az acr update --name $REGISTRY_NAME --admin-enabled false
 
-# 7. Deploy en Azure App Service
-echo "🚀 Desplegando en Azure App Service..."
-az webapp create \
-  --resource-group $RESOURCE_GROUP \
-  --plan $APP_SERVICE_PLAN \
-  --name $APP_SERVICE_NAME \
-  --deployment-container-image-name $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:latest
-
+# 7. Crear el environment de Container Apps (solo la primera vez)
+echo "🌱 Creando Azure Container Apps Environment (si no existe)..."
+az containerapp env show --name $CONTAINERAPPS_ENV_NAME --resource-group $RESOURCE_GROUP > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "❌ Error en el deploy del App Service"
+  az containerapp env create \
+    --name $CONTAINERAPPS_ENV_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --location $LOCATION
+  if [ $? -ne 0 ]; then
+    echo "❌ Error al crear el environment de Container Apps"
     exit 1
+  fi
+else
+  echo "ℹ️ El environment de Container Apps ya existe, continuando..."
 fi
 
-# 8. Configurar autenticación ACR
-echo "🔧 Configurando autenticación ACR..."
+# 8. Leer variables del .env del directorio raíz y formatearlas para Azure
+echo "⚙️ Preparando variables de entorno para la app..."
+ENV_VARS=""
+if [ -f .env ]; then
+  while IFS='=' read -r key value; do
+    if [[ ! "$key" =~ ^# ]] && [[ -n "$key" ]]; then
+      key=$(echo $key | xargs)
+      value=$(echo $value | sed 's/^"\(.*\)"$/\1/' | xargs)
+      ENV_VARS="$ENV_VARS $key=$value"
+    fi
+  done < .env
+else
+  echo "❌ Error: No se encontró el archivo .env (variables de entorno de la app Hydrogen)"
+  exit 1
+fi
 
-# Habilitar usuario administrador en ACR
-echo "🔑 Habilitando usuario administrador en ACR..."
-az acr update --name $REGISTRY_NAME --admin-enabled true
+# 9. Crear o actualizar el Container App
+echo "🚀 Desplegando en Azure Container Apps..."
+az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+  echo "🔄 El Container App ya existe, actualizando imagen y variables de entorno..."
+  az containerapp update \
+    --name $CONTAINER_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --image $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG \
+    --set-env-vars $ENV_VARS
+else
+  echo "🆕 El Container App no existe, creándolo..."
+  az containerapp create \
+    --name $CONTAINER_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --environment $CONTAINERAPPS_ENV_NAME \
+    --image $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG \
+    --target-port 3000 \
+    --ingress external \
+    --registry-server $REGISTRY_NAME.azurecr.io \
+    --assign-identity --system-assigned \
+    --env-vars $ENV_VARS
+  
+  # Asignar permisos AcrPull a la identidad del Container App
+  echo "🔐 Asignando permisos AcrPull a la Container App..."
+  PRINCIPAL_ID=$(az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP --query "identity.principalId" --output tsv)
+  ACR_ID=$(az acr show --name $REGISTRY_NAME --resource-group $RESOURCE_GROUP --query "id" --output tsv)
+  az role assignment create --assignee $PRINCIPAL_ID --role "AcrPull" --scope $ACR_ID
+fi
 
-# Obtener credenciales de administrador
-echo "📋 Obteniendo credenciales de ACR..."
-ACR_USERNAME=$(az acr credential show --name $REGISTRY_NAME --query "username" --output tsv)
-ACR_PASSWORD=$(az acr credential show --name $REGISTRY_NAME --query "passwords[0].value" --output tsv)
-
-# Configurar container con credenciales
-echo "🐳 Configurando container con credenciales..."
-az webapp config container set \
-  --name $APP_SERVICE_NAME \
-  --resource-group $RESOURCE_GROUP \
-  --docker-custom-image-name $REGISTRY_NAME.azurecr.io/$DOCKER_IMAGE_NAME:latest \
-  --docker-registry-server-url https://$REGISTRY_NAME.azurecr.io \
-  --docker-registry-server-user $ACR_USERNAME \
-  --docker-registry-server-password $ACR_PASSWORD
-
-# 9. Configurar variables de entorno
-echo "⚙️ Configurando variables de entorno..."
-az webapp config appsettings set \
-  --name $APP_SERVICE_NAME \
-  --resource-group $RESOURCE_GROUP \
-
-# 9.1. Habilitar logging para diagnóstico
-echo "📋 Habilitando logging..."
-az webapp log config \
-  --name $APP_SERVICE_NAME \
-  --resource-group $RESOURCE_GROUP \
-  --docker-container-logging filesystem
-
-
-# 10. Reiniciar App Service
-echo "🔄 Reiniciando App Service..."
-az webapp restart --name $APP_SERVICE_NAME --resource-group $RESOURCE_GROUP
+if [ $? -ne 0 ]; then
+  echo "❌ Error al crear el Container App"
+  exit 1
+fi
 
 echo "✅ Deploy completado exitosamente!"
-echo "🌐 Tu aplicación estará disponible en: https://$APP_SERVICE_NAME.azurewebsites.net"
+echo "🌐 Cuando esté listo, tu aplicación estará disponible en la URL pública de Azure Container Apps."
 echo "⏱️ La aplicación puede tardar unos minutos en estar completamente operativa"
